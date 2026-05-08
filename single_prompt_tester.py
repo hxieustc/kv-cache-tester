@@ -40,6 +40,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import sys
 import time
 from dataclasses import dataclass, asdict
@@ -389,6 +390,21 @@ def scrape_until_stable(endpoint: str, keys: list, max_wait: float = 10.0,
             return curr
         prev = curr
     return curr  # return last scrape even if not fully stable
+
+
+def compute_bust_count(context_size: int, num_gpu_blocks: int,
+                       block_size: int, safety_factor: float) -> int:
+    """Compute how many concurrent bust requests are needed to saturate the
+    L1 GPU KV cache (and therefore evict the test prompt's blocks) at a given
+    context size.
+
+    Each request occupies ceil(context_size / block_size) GPU blocks, so to
+    fill num_gpu_blocks total we need num_gpu_blocks / blocks_per_request
+    concurrent requests. safety_factor adds headroom for output tokens,
+    reserved blocks, and non-strict-LRU eviction policies.
+    """
+    blocks_per_request = math.ceil(context_size / block_size)
+    return max(1, math.ceil(num_gpu_blocks * safety_factor / blocks_per_request))
 
 
 async def send_bust_requests(api_client: APIClient, tokenizer: TokenizerManager,
@@ -898,6 +914,17 @@ async def main():
                             "test KV from GPU cache. Use with servers that have prefix caching "
                             "enabled (e.g., TRT-LLM enable_block_reuse). Each bust request sends "
                             "a unique prompt at the same context size. (default: 0 = disabled)")
+    parser.add_argument("--auto-bust", action="store_true",
+                       help="Auto-compute bust requests per context size from L1 GPU cache "
+                            "geometry. Requires --num-gpu-blocks and --block-size. "
+                            "Mutually exclusive with --bust-requests.")
+    parser.add_argument("--num-gpu-blocks", type=int, default=None,
+                       help="L1 GPU KV cache capacity in blocks. Required when --auto-bust is set.")
+    parser.add_argument("--block-size", type=int, default=None,
+                       help="Tokens per GPU KV cache block. Required when --auto-bust is set.")
+    parser.add_argument("--bust-safety-factor", type=float, default=1.1,
+                       help="Multiplier on the auto-computed bust count for safety margin "
+                            "(default: 1.1 = 10%% headroom).")
     parser.add_argument("--metrics-endpoint", type=str, default=None,
                        help="Server endpoint for Prometheus metrics scraping (e.g., http://host:8000). "
                             "Scrapes /prometheus/metrics before and after each warm request to isolate "
@@ -916,6 +943,15 @@ async def main():
                        help="Disable colored output (useful for light terminal backgrounds)")
 
     args = parser.parse_args()
+
+    # Validate auto-bust args
+    if args.auto_bust:
+        if args.bust_requests > 0:
+            parser.error("--auto-bust and --bust-requests are mutually exclusive")
+        if args.num_gpu_blocks is None or args.block_size is None:
+            parser.error("--auto-bust requires both --num-gpu-blocks and --block-size")
+        if args.num_gpu_blocks <= 0 or args.block_size <= 0:
+            parser.error("--num-gpu-blocks and --block-size must be positive")
 
     # Disable colors if requested
     if args.no_color:
@@ -936,6 +972,8 @@ async def main():
     logger.info(f"{Colors.OKBLUE}Iterations per size: {args.num_iterations}{Colors.ENDC}")
     if args.bust_requests > 0:
         logger.info(f"{Colors.OKBLUE}Bust requests per iteration: {args.bust_requests} (GPU cache eviction enabled){Colors.ENDC}")
+    elif args.auto_bust:
+        logger.info(f"{Colors.OKBLUE}Bust requests: auto (computed per ISL from cache geometry){Colors.ENDC}")
     logger.info(f"{Colors.HEADER}{'='*80}{Colors.ENDC}")
 
     # Initialize API client
@@ -981,7 +1019,24 @@ async def main():
 
     concurrent_prompts = args.concurrent_prompts
     cached_repeats = args.cached_repeats
-    bust_requests = args.bust_requests
+
+    # Build per-context-size bust count. In auto mode, compute from cache
+    # geometry; otherwise use the scalar --bust-requests for every size.
+    if args.auto_bust:
+        bust_per_ctx = {
+            ctx: compute_bust_count(ctx, args.num_gpu_blocks,
+                                    args.block_size, args.bust_safety_factor)
+            for ctx in context_sizes
+        }
+        logger.info(f"{Colors.OKBLUE}Auto-bust enabled: num_gpu_blocks={args.num_gpu_blocks}, "
+                    f"block_size={args.block_size}, safety_factor={args.bust_safety_factor}{Colors.ENDC}")
+        for ctx in context_sizes:
+            blocks_per_req = math.ceil(ctx / args.block_size)
+            logger.info(f"{Colors.OKBLUE}  ISL={ctx:,}: {bust_per_ctx[ctx]} bust requests "
+                        f"({blocks_per_req} blocks/req){Colors.ENDC}")
+    else:
+        bust_per_ctx = {ctx: args.bust_requests for ctx in context_sizes}
+
     if concurrent_prompts > 1:
         logger.info(f"{Colors.OKBLUE}Concurrent prompts per test: {concurrent_prompts}{Colors.ENDC}")
     if cached_repeats > 1:
@@ -995,7 +1050,9 @@ async def main():
     all_results = []
 
     for context_size in context_sizes:
-        logger.info(f"{Colors.OKCYAN}Testing context size: {context_size:,} tokens{Colors.ENDC}")
+        bust_requests = bust_per_ctx[context_size]
+        logger.info(f"{Colors.OKCYAN}Testing context size: {context_size:,} tokens"
+                    f"{f' (bust={bust_requests})' if bust_requests > 0 else ''}{Colors.ENDC}")
 
         context_unique_metrics = []
         context_cached_metrics = []
@@ -1050,10 +1107,15 @@ async def main():
         "context_sizes": context_sizes,
         "num_iterations": args.num_iterations,
         "concurrent_prompts": concurrent_prompts,
-        "bust_requests": bust_requests,
+        "bust_requests": bust_per_ctx if args.auto_bust else args.bust_requests,
+        "auto_bust": args.auto_bust,
         "output_tokens": args.output_tokens,
         "seed": base_seed
     }
+    if args.auto_bust:
+        metadata["num_gpu_blocks"] = args.num_gpu_blocks
+        metadata["block_size"] = args.block_size
+        metadata["bust_safety_factor"] = args.bust_safety_factor
     metadata_file = output_path / "metadata.json"
     with open(metadata_file, 'w') as f:
         json.dump(metadata, f, indent=2)
@@ -1105,8 +1167,10 @@ async def main():
         print(f"model: {model}")
         print(f"endpoint: {args.api_endpoint}")
         print(f"seed: {base_seed}")
-        if bust_requests > 0:
-            print(f"bust_requests: {bust_requests}")
+        if args.auto_bust:
+            print(f"bust_requests: auto {bust_per_ctx}")
+        elif args.bust_requests > 0:
+            print(f"bust_requests: {args.bust_requests}")
         print(f"output: {args.output_dir}")
         print()
         print(f"{'Context':>10} | {'Unique TTFT':>12} | {'Cached TTFT':>12} | {'Speedup':>8}")

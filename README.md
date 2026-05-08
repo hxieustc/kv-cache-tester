@@ -18,6 +18,13 @@ uv run python single_prompt_tester.py \
     --max-tokens 128000 \
     --output-dir results
 
+# Single-prompt test with auto-bust (forces L1 GPU eviction sized to your cache)
+uv run python single_prompt_tester.py \
+    --api-endpoint http://localhost:8000 \
+    --context-sizes 1024 8192 65536 \
+    --auto-bust --num-gpu-blocks 1024 --block-size 64 \
+    --output-dir results
+
 # Test various cache hit rates (sustained mode - default)
 uv run python cache_rate_tester.py \
     --api-endpoint http://localhost:8000 \
