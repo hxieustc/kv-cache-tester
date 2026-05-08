@@ -10,10 +10,11 @@ across doubling context sizes to understand:
 
 Test pattern for each context size:
 1. Send unique prompt (cold start)
-2. Send identical prompt again (100% cache hit)
-3. Measure TTFT, TTLT, throughput for both
+2. [Optional] Send N bust requests to evict test KV from GPU cache
+3. Send identical prompt again (warm = host cache hit)
+4. Measure TTFT, TTLT, throughput for both
 
-Version: 1.0
+Version: 1.1
 Date: 2025-10-24
 
 Usage:
@@ -24,6 +25,15 @@ Usage:
         --output-tokens 256 \\
         --num-iterations 5 \\
         --output-dir single_prompt_results
+
+    # With bust phase (for servers with prefix caching enabled):
+    python single_prompt_tester.py \\
+        --api-endpoint http://localhost:8000 \\
+        --context-sizes 1024 4096 8192 \\
+        --bust-requests 8 \\
+        --output-tokens 1 \\
+        --num-iterations 15 \\
+        --brief
 """
 
 import argparse
@@ -130,6 +140,12 @@ class PromptMetrics:
     generation_time: float
     total_time: float
     output_tokens_per_sec: float  # Per-request generation speed
+    onboard_bytes: float = 0.0    # Bytes transferred host→GPU (from Prometheus delta)
+    onboard_ms: float = 0.0      # GPU-measured transfer time in ms
+    onboard_gbps: float = 0.0    # Transfer bandwidth in GB/s
+    offload_bytes: float = 0.0   # Bytes transferred GPU→host (from Prometheus delta)
+    offload_ms: float = 0.0      # GPU-measured transfer time in ms
+    offload_gbps: float = 0.0    # Transfer bandwidth in GB/s
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -308,11 +324,103 @@ class APIClient:
             raise
 
 
+def scrape_metrics(endpoint: str, keys: list = None):
+    """Scrape Prometheus metrics from the server. Returns dict of metric_name → value.
+    Tries /prometheus/metrics (TRT-LLM) then /metrics (vLLM) endpoints."""
+    import requests as req
+    if not endpoint:
+        return {}
+    try:
+        base = endpoint.rstrip('/')
+        # Try TRT-LLM endpoint first, then vLLM
+        for path in ['/prometheus/metrics', '/metrics']:
+            try:
+                resp = req.get(base + path, timeout=5)
+                if resp.status_code == 200 and resp.text.strip():
+                    break
+            except Exception:
+                continue
+        else:
+            return {}
+        metrics = {}
+        for line in resp.text.split('\n'):
+            if line.startswith('#') or not line.strip():
+                continue
+            # Parse: metric_name{labels} value
+            # Keep full key including labels for disambiguation
+            parts = line.rsplit(None, 1)  # split on last whitespace
+            if len(parts) == 2:
+                full_key = parts[0]  # e.g. metric_name{label="val"}
+                base_name = full_key.split('{')[0]
+                if keys is None or base_name in keys:
+                    try:
+                        metrics[full_key] = float(parts[1])
+                    except ValueError:
+                        pass
+        return metrics
+    except Exception:
+        return {}
+
+
+def metrics_delta(before: dict, after: dict) -> dict:
+    """Compute delta between two metric scrapes."""
+    delta = {}
+    for k in after:
+        if k in before:
+            delta[k] = after[k] - before[k]
+        else:
+            delta[k] = after[k]
+    return delta
+
+
+def scrape_until_stable(endpoint: str, keys: list, max_wait: float = 10.0,
+                        poll_interval: float = 0.5) -> dict:
+    """Scrape metrics repeatedly until counters stop changing.
+    Returns the stable metrics snapshot."""
+    import time as _time
+    prev = scrape_metrics(endpoint, keys)
+    deadline = _time.time() + max_wait
+    while _time.time() < deadline:
+        _time.sleep(poll_interval)
+        curr = scrape_metrics(endpoint, keys)
+        delta = metrics_delta(prev, curr)
+        # Check if all counter values stopped changing
+        if all(abs(v) < 1e-6 for v in delta.values()):
+            return curr
+        prev = curr
+    return curr  # return last scrape even if not fully stable
+
+
+async def send_bust_requests(api_client: APIClient, tokenizer: TokenizerManager,
+                             context_size: int, output_tokens: int,
+                             num_bust: int, base_seed: int, iteration: int,
+                             repeat: int = 0):
+    """
+    Send N unique requests to pressure the GPU KV cache and evict the test
+    prompt's blocks. Each bust request uses a different seed so it won't
+    match any cached prefix. Requests are sent concurrently for speed.
+    """
+    async def send_one(b):
+        bust_seed = base_seed + iteration * 100000 + repeat * 10000 + 90000 + b * 77 + context_size
+        bust_tokens = tokenizer.generate_dummy_tokens(context_size, seed=bust_seed)
+        bust_prompt = tokenizer.decode(bust_tokens) + "\n\nSummarize briefly."
+        await api_client.send_request(bust_prompt, output_tokens)
+
+    await asyncio.gather(*[send_one(b) for b in range(num_bust)])
+    logger.info(f"      Bust: sent {num_bust} fill requests concurrently ({context_size:,} tok each)")
+
+
 async def test_single_prompt_pair(api_client: APIClient, tokenizer: TokenizerManager,
                                   context_size: int, output_tokens: int, iteration: int, base_seed: int,
-                                  concurrent_prompts: int = 1, cached_repeats: int = 1) -> Tuple[List[PromptMetrics], List[PromptMetrics]]:
+                                  concurrent_prompts: int = 1, cached_repeats: int = 1,
+                                  bust_requests: int = 0,
+                                  metrics_endpoint: str = None) -> Tuple[List[PromptMetrics], List[PromptMetrics]]:
     """
-    Test unique prompts followed by cached repeats
+    Test unique prompts followed by cached repeats.
+    If bust_requests > 0, sends fill requests between cold and warm to evict
+    the test prompt's KV blocks from GPU cache (for servers with prefix caching).
+    If metrics_endpoint is set, scrapes Prometheus metrics before/after warm request
+    to isolate transfer stats for just the warm path.
     Returns: (list of unique_metrics, list of cached_metrics)
     """
     # Generate unique prompts with seed offset for this iteration
@@ -335,6 +443,42 @@ async def test_single_prompt_pair(api_client: APIClient, tokenizer: TokenizerMan
         # Calculate absolute first-token time relative to batch start
         absolute_first_token = (start_time - batch_start_ref) + ttft
         return response_text, ttft, gen_time, prompt_tok, completion_tok, total_time, absolute_first_token
+
+    import asyncio as _aio
+
+    # Scrape metrics before cold request (for offload measurement)
+    # Support both TRT-LLM and vLLM metric names
+    TRANSFER_KEYS = None  # None = scrape all keys, filter later
+
+    def _extract_transfer(delta):
+        """Extract onboard/offload bytes and time from a metrics delta.
+        Supports TRT-LLM and vLLM native offloading metric names."""
+        # TRT-LLM keys (time in ms)
+        on_bytes = delta.get('trtllm_kv_cache_onboard_bytes_total', 0)
+        on_time = delta.get('trtllm_kv_cache_onboard_time_ms_total', 0)  # ms
+        off_bytes = delta.get('trtllm_kv_cache_offload_bytes_total', 0)
+        off_time = delta.get('trtllm_kv_cache_offload_time_ms_total', 0)  # ms
+
+        # vLLM native offloading keys (time in seconds, labeled by transfer_type)
+        # Prometheus exposition flattens labels into key: metric_name{label="val"} value
+        # cpu_to_gpu = onboard, gpu_to_cpu = offload
+        if on_bytes == 0:
+            for k, v in delta.items():
+                kl = k.lower()
+                # Skip _created metrics (Unix timestamps, not counters)
+                if '_created' in kl:
+                    continue
+                if 'kv_offload_total_bytes' in kl and 'cpu_to_gpu' in kl:
+                    on_bytes = v
+                elif 'kv_offload_total_time' in kl and 'cpu_to_gpu' in kl:
+                    on_time = v * 1000  # convert s → ms
+                elif 'kv_offload_total_bytes' in kl and 'gpu_to_cpu' in kl:
+                    off_bytes = v
+                elif 'kv_offload_total_time' in kl and 'gpu_to_cpu' in kl:
+                    off_time = v * 1000  # convert s → ms
+
+        return on_bytes, on_time, off_bytes, off_time
+    cold_metrics_before = scrape_metrics(metrics_endpoint, TRANSFER_KEYS) if metrics_endpoint else {}
 
     # Send all unique prompts simultaneously
     batch_start = time.time()
@@ -382,10 +526,43 @@ async def test_single_prompt_pair(api_client: APIClient, tokenizer: TokenizerMan
         logger.info(f"      Unique: TTFT={avg_ttft:.3f}s, Output={int(avg_completion)} tok")
         logger.info(f"      Response: {snippet}...")
 
-    # Test cached prompts (same prompts again - 100% cache hit) - send all simultaneously
+    # Scrape after cold request to capture offload (write-through) metrics
+    # Wait until counters stabilize (no more async updates from cold offload)
+    if cold_metrics_before:
+        cold_metrics_after = await _aio.to_thread(
+            scrape_until_stable, metrics_endpoint, TRANSFER_KEYS)
+        cold_delta = metrics_delta(cold_metrics_before, cold_metrics_after)
+        _, _, cold_offload_bytes, cold_offload_ms = _extract_transfer(cold_delta)
+
+        if cold_offload_bytes > 0 and cold_offload_ms > 0:
+            cold_offload_bw = cold_offload_bytes / 1e9 / (cold_offload_ms / 1000)
+            logger.info(f"      Cold offload: {cold_offload_bytes/1e9:.2f} GB in {cold_offload_ms:.1f} ms → {cold_offload_bw:.1f} GB/s")
+            for m in unique_metrics_list:
+                n_unique = len(unique_metrics_list)
+                m.offload_bytes = cold_offload_bytes / n_unique
+                m.offload_ms = cold_offload_ms / n_unique
+                m.offload_gbps = cold_offload_bw
+            print(f"  cold offload: {cold_offload_bytes/1e9:.2f}GB in {cold_offload_ms:.1f}ms → {cold_offload_bw:.1f} GB/s")
+
+    # Test cached prompts (same prompts again - 100% cache hit)
+    # If bust_requests > 0, bust before EACH repeat to force onboard every time.
     cached_metrics_list = []
 
     for repeat in range(cached_repeats):
+        # ── Bust phase: evict test prompt's KV from GPU cache ──────────────
+        if bust_requests > 0:
+            await send_bust_requests(
+                api_client, tokenizer, context_size, output_tokens,
+                bust_requests, base_seed, iteration, repeat=repeat
+            )
+
+        # Scrape metrics before warm request (after bust completes)
+        if metrics_endpoint:
+            metrics_before = await _aio.to_thread(
+                scrape_until_stable, metrics_endpoint, TRANSFER_KEYS)
+        else:
+            metrics_before = {}
+
         repeat_label = f" (repeat {repeat + 1}/{cached_repeats})" if cached_repeats > 1 else ""
         logger.info(f"    Iteration {iteration + 1}: Testing {concurrent_prompts} cached {prompt_label}{repeat_label}...")
 
@@ -415,14 +592,49 @@ async def test_single_prompt_pair(api_client: APIClient, tokenizer: TokenizerMan
                 logger.info(f"        [Prompt {i+1}] TTFT={ttft:.3f}s, abs_time={abs_ttft:.3f}s, output={completion_tok} tok")
                 logger.info(f"                  Response: {snippet}...")
 
+        # Scrape metrics after this repeat and attribute transfer to this repeat's metrics
+        if metrics_before:
+            metrics_after = await _aio.to_thread(
+                scrape_until_stable, metrics_endpoint, TRANSFER_KEYS)
+            delta = metrics_delta(metrics_before, metrics_after)
+            onboard_bytes, onboard_ms, offload_bytes, offload_ms = _extract_transfer(delta)
+
+            # Fail fast if bust was used but no onboard detected
+            if bust_requests > 0 and onboard_bytes == 0:
+                logger.error(
+                    f"FAIL-FAST: bust_requests={bust_requests} but onboard_bytes=0 "
+                    f"at ISL={context_size}, iteration={iteration}, repeat={repeat+1}. "
+                    f"Bust did not evict blocks or offloading is not active."
+                )
+                raise RuntimeError(
+                    f"No onboard transfer detected after {bust_requests} bust requests "
+                    f"at ISL={context_size}. Check --num-gpu-blocks-override and bust count."
+                )
+
+            repeat_metrics = cached_metrics_list[-concurrent_prompts:]
+            n_repeat = len(repeat_metrics)
+            if n_repeat > 0:
+                if onboard_bytes > 0 and onboard_ms > 0:
+                    onboard_bw = onboard_bytes / 1e9 / (onboard_ms / 1000)
+                    for m in repeat_metrics:
+                        m.onboard_bytes = onboard_bytes / n_repeat
+                        m.onboard_ms = onboard_ms / n_repeat
+                        m.onboard_gbps = onboard_bw
+                if offload_bytes > 0 and offload_ms > 0:
+                    offload_bw = offload_bytes / 1e9 / (offload_ms / 1000)
+                    for m in repeat_metrics:
+                        m.offload_bytes = offload_bytes / n_repeat
+                        m.offload_ms = offload_ms / n_repeat
+                        m.offload_gbps = offload_bw
+
         # Log summary for this cached repeat
-        repeat_metrics = cached_metrics_list[-concurrent_prompts:]  # Get metrics from this repeat
+        repeat_metrics = cached_metrics_list[-concurrent_prompts:]
         avg_cached_ttft = np.mean([m.ttft for m in repeat_metrics])
         avg_cached_completion = np.mean([m.completion_tokens for m in repeat_metrics])
         if concurrent_prompts > 1:
             abs_times_cached = [r[6] for r in cached_results]
             abs_spread_cached = max(abs_times_cached) - min(abs_times_cached)
-            prefill_time_cached = max(abs_times_cached)  # Time until all prompts got first token
+            prefill_time_cached = max(abs_times_cached)
             effective_prefill_per_prompt_cached = prefill_time_cached / concurrent_prompts
             total_input_tokens_cached = sum([m.prompt_tokens for m in repeat_metrics])
             logger.info(f"      Cached{repeat_label} batch summary:")
@@ -438,6 +650,17 @@ async def test_single_prompt_pair(api_client: APIClient, tokenizer: TokenizerMan
     overall_avg_cached_ttft = np.mean([m.ttft for m in cached_metrics_list])
     speedup = avg_ttft / overall_avg_cached_ttft if overall_avg_cached_ttft > 0 else 0
     logger.info(f"      Cache speedup: TTFT {speedup:.2f}x faster")
+
+    # Print transfer summary (last repeat's transfer as representative)
+    if metrics_endpoint and cached_metrics_list:
+        last_m = cached_metrics_list[-1]
+        parts = []
+        if last_m.onboard_bytes > 0 and last_m.onboard_ms > 0:
+            parts.append(f"onboard {last_m.onboard_bytes/1e9:.2f}GB in {last_m.onboard_ms:.1f}ms → {last_m.onboard_gbps:.1f} GB/s")
+        if last_m.offload_bytes > 0 and last_m.offload_ms > 0:
+            parts.append(f"offload {last_m.offload_bytes/1e9:.2f}GB in {last_m.offload_ms:.1f}ms → {last_m.offload_gbps:.1f} GB/s")
+        if parts:
+            print(f"  transfer: {' | '.join(parts)}")
 
     return unique_metrics_list, cached_metrics_list
 
@@ -670,6 +893,15 @@ async def main():
                        help="Number of prompts to send simultaneously (default: 1)")
     parser.add_argument("--cached-repeats", "-r", type=int, default=1,
                        help="Number of times to repeat cached prompt after unique (default: 1)")
+    parser.add_argument("--bust-requests", "-b", type=int, default=0,
+                       help="Number of fill requests to send between cold and warm to evict "
+                            "test KV from GPU cache. Use with servers that have prefix caching "
+                            "enabled (e.g., TRT-LLM enable_block_reuse). Each bust request sends "
+                            "a unique prompt at the same context size. (default: 0 = disabled)")
+    parser.add_argument("--metrics-endpoint", type=str, default=None,
+                       help="Server endpoint for Prometheus metrics scraping (e.g., http://host:8000). "
+                            "Scrapes /prometheus/metrics before and after each warm request to isolate "
+                            "KV transfer stats. (default: None = disabled)")
     parser.add_argument("--output-dir", type=str, default="./single_prompt_output",
                        help="Output directory (default: ./single_prompt_output)")
     parser.add_argument("--tokenizer", type=str, default="Qwen/Qwen2.5-Coder-32B-Instruct",
@@ -702,6 +934,8 @@ async def main():
     logger.info(f"{Colors.HEADER}{'='*80}{Colors.ENDC}")
     logger.info(f"{Colors.OKBLUE}API Endpoint: {args.api_endpoint}{Colors.ENDC}")
     logger.info(f"{Colors.OKBLUE}Iterations per size: {args.num_iterations}{Colors.ENDC}")
+    if args.bust_requests > 0:
+        logger.info(f"{Colors.OKBLUE}Bust requests per iteration: {args.bust_requests} (GPU cache eviction enabled){Colors.ENDC}")
     logger.info(f"{Colors.HEADER}{'='*80}{Colors.ENDC}")
 
     # Initialize API client
@@ -747,6 +981,7 @@ async def main():
 
     concurrent_prompts = args.concurrent_prompts
     cached_repeats = args.cached_repeats
+    bust_requests = args.bust_requests
     if concurrent_prompts > 1:
         logger.info(f"{Colors.OKBLUE}Concurrent prompts per test: {concurrent_prompts}{Colors.ENDC}")
     if cached_repeats > 1:
@@ -768,7 +1003,9 @@ async def main():
         for iteration in range(args.num_iterations):
             unique_metrics_list, cached_metrics_list = await test_single_prompt_pair(
                 api_client, tokenizer, context_size, args.output_tokens, iteration, base_seed,
-                concurrent_prompts=concurrent_prompts, cached_repeats=cached_repeats
+                concurrent_prompts=concurrent_prompts, cached_repeats=cached_repeats,
+                bust_requests=bust_requests,
+                metrics_endpoint=args.metrics_endpoint
             )
             all_results.extend(unique_metrics_list)
             all_results.extend(cached_metrics_list)
@@ -813,6 +1050,7 @@ async def main():
         "context_sizes": context_sizes,
         "num_iterations": args.num_iterations,
         "concurrent_prompts": concurrent_prompts,
+        "bust_requests": bust_requests,
         "output_tokens": args.output_tokens,
         "seed": base_seed
     }
@@ -867,6 +1105,8 @@ async def main():
         print(f"model: {model}")
         print(f"endpoint: {args.api_endpoint}")
         print(f"seed: {base_seed}")
+        if bust_requests > 0:
+            print(f"bust_requests: {bust_requests}")
         print(f"output: {args.output_dir}")
         print()
         print(f"{'Context':>10} | {'Unique TTFT':>12} | {'Cached TTFT':>12} | {'Speedup':>8}")
