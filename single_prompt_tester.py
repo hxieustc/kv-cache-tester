@@ -469,6 +469,7 @@ async def test_single_prompt_pair(api_client: APIClient, tokenizer: TokenizerMan
     def _extract_transfer(delta):
         """Extract onboard/offload bytes and time from a metrics delta.
         Supports TRT-LLM, vLLM native offloading, and SGLang HiCache L1/L2 metrics."""
+
         # TRT-LLM keys (time in ms)
         on_bytes = delta.get('trtllm_kv_cache_onboard_bytes_total', 0)
         on_time = delta.get('trtllm_kv_cache_onboard_time_ms_total', 0)  # ms
@@ -529,7 +530,12 @@ async def test_single_prompt_pair(api_client: APIClient, tokenizer: TokenizerMan
         if sg_off_time_us > 0:
             off_time = sg_off_time_us / 1000  # convert us → ms
 
+        logger.info(f"      Transfer delta: onboard {on_bytes/1e9:.2f} GB in {on_time:.1f} ms,"
+                    f" offload {off_bytes/1e9:.2f} GB in {off_time:.1f} ms"
+                    )
+
         return on_bytes, on_time, off_bytes, off_time
+
     cold_metrics_before = scrape_metrics(metrics_endpoint, TRANSFER_KEYS) if metrics_endpoint else {}
 
     # Send all unique prompts simultaneously
