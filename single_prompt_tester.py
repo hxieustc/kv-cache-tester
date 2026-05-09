@@ -468,7 +468,7 @@ async def test_single_prompt_pair(api_client: APIClient, tokenizer: TokenizerMan
 
     def _extract_transfer(delta):
         """Extract onboard/offload bytes and time from a metrics delta.
-        Supports TRT-LLM and vLLM native offloading metric names."""
+        Supports TRT-LLM, vLLM native offloading, and SGLang HiCache L1/L2 metrics."""
         # TRT-LLM keys (time in ms)
         on_bytes = delta.get('trtllm_kv_cache_onboard_bytes_total', 0)
         on_time = delta.get('trtllm_kv_cache_onboard_time_ms_total', 0)  # ms
@@ -492,6 +492,42 @@ async def test_single_prompt_pair(api_client: APIClient, tokenizer: TokenizerMan
                     off_bytes = v
                 elif 'kv_offload_total_time' in kl and 'gpu_to_cpu' in kl:
                     off_time = v * 1000  # convert s → ms
+
+        # SGLang HiCache L1<->L2 keys (time in microseconds).
+        # Sum across ranks/backends because each label set is a separate series.
+        sg_on_bytes = 0
+        sg_on_time_us = 0
+        sg_off_bytes = 0
+        sg_off_time_us = 0
+        for k, v in delta.items():
+            kl = k.lower()
+            if '_created' in kl:
+                continue
+
+            is_onboard = 'direction="onboard"' in kl
+            is_offload = 'direction="offload"' in kl
+            if not (is_onboard or is_offload):
+                continue
+
+            if 'hicache_l1_l2_transfer_bytes_total' in kl:
+                if is_onboard:
+                    sg_on_bytes += v
+                else:
+                    sg_off_bytes += v
+            elif 'hicache_l1_l2_transfer_time_us_total' in kl:
+                if is_onboard:
+                    sg_on_time_us += v
+                else:
+                    sg_off_time_us += v
+
+        if sg_on_bytes > 0:
+            on_bytes = sg_on_bytes
+        if sg_on_time_us > 0:
+            on_time = sg_on_time_us / 1000  # convert us → ms
+        if sg_off_bytes > 0:
+            off_bytes = sg_off_bytes
+        if sg_off_time_us > 0:
+            off_time = sg_off_time_us / 1000  # convert us → ms
 
         return on_bytes, on_time, off_bytes, off_time
     cold_metrics_before = scrape_metrics(metrics_endpoint, TRANSFER_KEYS) if metrics_endpoint else {}
