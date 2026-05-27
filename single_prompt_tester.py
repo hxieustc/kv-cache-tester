@@ -468,7 +468,8 @@ async def test_single_prompt_pair(api_client: APIClient, tokenizer: TokenizerMan
 
     def _extract_transfer(delta):
         """Extract onboard/offload bytes and time from a metrics delta.
-        Supports TRT-LLM, vLLM native offloading, and SGLang HiCache L1/L2 metrics."""
+        Supports TRT-LLM, vLLM native offloading, SGLang HiCache L1/L2, and
+        Pegaflow load/save metrics."""
 
         # TRT-LLM keys (time in ms)
         on_bytes = delta.get('trtllm_kv_cache_onboard_bytes_total', 0)
@@ -529,6 +530,40 @@ async def test_single_prompt_pair(api_client: APIClient, tokenizer: TokenizerMan
             off_bytes = sg_off_bytes
         if sg_off_time_us > 0:
             off_time = sg_off_time_us / 1000  # convert us → ms
+
+        # Pegaflow keys: bytes are counters, time is a histogram (_sum in seconds).
+        # save = GPU→CPU = offload, load = CPU→GPU = onboard.
+        pf_on_bytes = delta.get('pegaflow_load_bytes_total', 0)
+        pf_off_bytes = delta.get('pegaflow_save_bytes_total', 0)
+        pf_on_time_s = 0
+        pf_off_time_s = 0
+        pf_load_failures = 0
+        for k, v in delta.items():
+            kl = k.lower()
+            if '_created' in kl or '_bucket' in kl or '_count' in kl:
+                continue
+            if kl.startswith('pegaflow_load_duration_seconds_sum'):
+                pf_on_time_s += v
+            elif kl.startswith('pegaflow_save_duration_seconds_sum'):
+                pf_off_time_s += v
+            elif kl.startswith('pegaflow_load_failures_total'):
+                pf_load_failures += v
+
+        if pf_on_bytes > 0:
+            on_bytes = pf_on_bytes
+        if pf_on_time_s > 0:
+            on_time = pf_on_time_s * 1000  # convert s → ms
+        if pf_off_bytes > 0:
+            off_bytes = pf_off_bytes
+        if pf_off_time_s > 0:
+            off_time = pf_off_time_s * 1000  # convert s → ms
+
+        if pf_load_failures > 0:
+            logger.warning(
+                f"      Pegaflow reported {pf_load_failures:.0f} load failure(s) "
+                f"(pegaflow_load_failures_total) in this window — "
+                f"CPU→GPU transfers may be incomplete."
+            )
 
         logger.info(f"      Transfer delta: onboard {on_bytes/1e9:.2f} GB in {on_time:.1f} ms,"
                     f" offload {off_bytes/1e9:.2f} GB in {off_time:.1f} ms"
