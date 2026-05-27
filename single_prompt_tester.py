@@ -533,8 +533,8 @@ async def test_single_prompt_pair(api_client: APIClient, tokenizer: TokenizerMan
 
         # Pegaflow keys: bytes are counters, time is a histogram (_sum in seconds).
         # save = GPU→CPU = offload, load = CPU→GPU = onboard.
-        pf_on_bytes = delta.get('pegaflow_load_bytes_total', 0)
-        pf_off_bytes = delta.get('pegaflow_save_bytes_total', 0)
+        pf_on_bytes = 0
+        pf_off_bytes = 0
         pf_on_time_s = 0
         pf_off_time_s = 0
         pf_load_failures = 0
@@ -542,11 +542,15 @@ async def test_single_prompt_pair(api_client: APIClient, tokenizer: TokenizerMan
             kl = k.lower()
             if '_created' in kl or '_bucket' in kl or '_count' in kl:
                 continue
-            if 'pegaflow_load_duration_seconds_sum' in kl:
+            if 'pegaflow_load_bytes_total' in kl and 'pegaflow-core' in kl:
+                pf_on_bytes += v
+            elif 'pegaflow_save_bytes_total' in kl and 'pegaflow-core' in kl:
+                pf_off_bytes += v
+            elif 'pegaflow_load_duration_seconds_sum' in kl and 'pegaflow-core' in kl:
                 pf_on_time_s += v
-            elif 'pegaflow_save_duration_seconds_sum' in kl:
+            elif 'pegaflow_save_duration_seconds_sum' in kl and 'pegaflow-core' in kl:
                 pf_off_time_s += v
-            elif 'pegaflow_load_failures_total' in kl:
+            elif 'pegaflow_load_failures_total' in kl and 'pegaflow-core' in kl:
                 pf_load_failures += v
 
         if pf_on_bytes > 0:
