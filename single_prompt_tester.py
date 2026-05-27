@@ -336,7 +336,9 @@ def scrape_metrics(endpoint: str, keys: list = None):
         # Try TRT-LLM endpoint first, then vLLM
         for path in ['/prometheus/metrics', '/metrics']:
             try:
-                resp = req.get(base + path, timeout=5)
+                uri = endpoint if endpoint.endswith(path) else base + path
+                
+                resp = req.get(uri, timeout=5)
                 if resp.status_code == 200 and resp.text.strip():
                     break
             except Exception:
