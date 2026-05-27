@@ -542,11 +542,11 @@ async def test_single_prompt_pair(api_client: APIClient, tokenizer: TokenizerMan
             kl = k.lower()
             if '_created' in kl or '_bucket' in kl or '_count' in kl:
                 continue
-            if kl.startswith('pegaflow_load_duration_seconds_sum'):
+            if 'pegaflow_load_duration_seconds_sum' in kl:
                 pf_on_time_s += v
-            elif kl.startswith('pegaflow_save_duration_seconds_sum'):
+            elif 'pegaflow_save_duration_seconds_sum' in kl:
                 pf_off_time_s += v
-            elif kl.startswith('pegaflow_load_failures_total'):
+            elif 'pegaflow_load_failures_total' in kl:
                 pf_load_failures += v
 
         if pf_on_bytes > 0:
